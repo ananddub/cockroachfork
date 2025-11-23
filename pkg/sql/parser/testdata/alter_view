@@ -1,0 +1,84 @@
+parse
+ALTER VIEW v SET SCHEMA s
+----
+ALTER VIEW v SET SCHEMA s
+ALTER VIEW v SET SCHEMA s -- fully parenthesized
+ALTER VIEW v SET SCHEMA s -- literals removed
+ALTER VIEW _ SET SCHEMA _ -- identifiers removed
+
+parse
+ALTER VIEW IF EXISTS a SET SCHEMA s
+----
+ALTER VIEW IF EXISTS a SET SCHEMA s
+ALTER VIEW IF EXISTS a SET SCHEMA s -- fully parenthesized
+ALTER VIEW IF EXISTS a SET SCHEMA s -- literals removed
+ALTER VIEW IF EXISTS _ SET SCHEMA _ -- identifiers removed
+
+parse
+ALTER MATERIALIZED VIEW v SET SCHEMA s
+----
+ALTER MATERIALIZED VIEW v SET SCHEMA s
+ALTER MATERIALIZED VIEW v SET SCHEMA s -- fully parenthesized
+ALTER MATERIALIZED VIEW v SET SCHEMA s -- literals removed
+ALTER MATERIALIZED VIEW _ SET SCHEMA _ -- identifiers removed
+
+parse
+ALTER MATERIALIZED VIEW IF EXISTS a SET SCHEMA s
+----
+ALTER MATERIALIZED VIEW IF EXISTS a SET SCHEMA s
+ALTER MATERIALIZED VIEW IF EXISTS a SET SCHEMA s -- fully parenthesized
+ALTER MATERIALIZED VIEW IF EXISTS a SET SCHEMA s -- literals removed
+ALTER MATERIALIZED VIEW IF EXISTS _ SET SCHEMA _ -- identifiers removed
+
+parse
+ALTER VIEW v RENAME TO v
+----
+ALTER VIEW v RENAME TO v
+ALTER VIEW v RENAME TO v -- fully parenthesized
+ALTER VIEW v RENAME TO v -- literals removed
+ALTER VIEW _ RENAME TO _ -- identifiers removed
+
+parse
+ALTER VIEW IF EXISTS v RENAME TO v
+----
+ALTER VIEW IF EXISTS v RENAME TO v
+ALTER VIEW IF EXISTS v RENAME TO v -- fully parenthesized
+ALTER VIEW IF EXISTS v RENAME TO v -- literals removed
+ALTER VIEW IF EXISTS _ RENAME TO _ -- identifiers removed
+
+parse
+ALTER MATERIALIZED VIEW v RENAME TO v
+----
+ALTER MATERIALIZED VIEW v RENAME TO v
+ALTER MATERIALIZED VIEW v RENAME TO v -- fully parenthesized
+ALTER MATERIALIZED VIEW v RENAME TO v -- literals removed
+ALTER MATERIALIZED VIEW _ RENAME TO _ -- identifiers removed
+
+parse
+ALTER MATERIALIZED VIEW IF EXISTS v RENAME TO v
+----
+ALTER MATERIALIZED VIEW IF EXISTS v RENAME TO v
+ALTER MATERIALIZED VIEW IF EXISTS v RENAME TO v -- fully parenthesized
+ALTER MATERIALIZED VIEW IF EXISTS v RENAME TO v -- literals removed
+ALTER MATERIALIZED VIEW IF EXISTS _ RENAME TO _ -- identifiers removed
+
+error
+ALTER VIEW v SET (security_invoker = true)
+----
+----
+at or near ")": syntax error: unimplemented: this syntax
+DETAIL: source SQL:
+ALTER VIEW v SET (security_invoker = true)
+                                         ^
+HINT: You have attempted to use a feature that is not yet implemented.
+
+Please check the public issue tracker to check whether this problem is
+already tracked. If you cannot find it there, please report the error
+with details by creating a new issue.
+
+If you would rather not post publicly, please contact us directly
+using the support form.
+
+We appreciate your feedback.
+----
+----

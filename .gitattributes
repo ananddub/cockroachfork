@@ -1,0 +1,5 @@
+.aspect/** -diff
+build/bazelutil/distdir_files.bzl -diff
+pkg/BUILD.bazel -diff
+pkg/protos.bzl -diff
+default/auxiliary/EMERGENCY_BALLAST filter=lfs diff=lfs merge=lfs -text

@@ -1,0 +1,13 @@
+root 1.0 MiB (20 GiB / 0 B)
+    sql 880 KiB
+        internal sql executor 30 KiB
+            session root 30 KiB
+                txn 20 KiB
+                session 20 KiB
+        SQLStats 690 KiB
+    server-cache-mon 10 KiB
+    leased-descriptors 40 KiB
+    closed-session-cache 10 KiB
+    kv-mem 30 KiB
+        rangefeed-monitor 30 KiB
+        rangefeed-system-monitor 80 KiB (128 MiB / 0 B)

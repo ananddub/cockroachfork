@@ -1,0 +1,793 @@
+// Copyright 2017 The Cockroach Authors.
+//
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
+
+package sql_test
+
+import (
+	"context"
+	gosql "database/sql"
+	"fmt"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/jobs"
+	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/backfill"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catenumpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/fetchpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
+	"github.com/cockroachdb/cockroach/pkg/sql/row"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowinfra"
+	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scexec"
+	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scop"
+	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scplan"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/idxtype"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
+	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
+	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
+	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/mon"
+	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
+	"github.com/cockroachdb/errors"
+	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/proto"
+)
+
+// TestIndexBackfiller tests the scenarios described in docs/tech-notes/index-backfill.md
+func TestIndexBackfiller(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	var params base.TestServerArgs
+
+	moveToTDelete := make(chan bool)
+	moveToTWrite := make(chan bool)
+	moveToTScan := make(chan bool)
+	moveToBackfill := make(chan bool)
+
+	moveToTMerge := make(chan bool)
+	backfillDone := make(chan bool)
+
+	params.Knobs = base.TestingKnobs{
+		SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
+			RunBeforePublishWriteAndDelete: func() {
+				// Signal that we've moved into DELETE_ONLY.
+				moveToTDelete <- true
+				// Wait until we get a signal to move to WRITE_ONLY.
+				<-moveToTWrite
+			},
+			RunBeforeBackfill: func() error {
+				// Wait until we get a signal to pick our scan timestamp.
+				<-moveToTScan
+				return nil
+			},
+			RunBeforeTempIndexMerge: func() {
+				backfillDone <- true
+				<-moveToTMerge
+			},
+			RunBeforeIndexBackfill: func() {
+				// Wait until we get a signal to begin backfill.
+				<-moveToBackfill
+			},
+		},
+	}
+
+	tc := serverutils.StartCluster(t, 3,
+		base.TestClusterArgs{
+			ServerArgs: params,
+		})
+	defer tc.Stopper().Stop(context.Background())
+	sqlDB := tc.ServerConn(0)
+
+	execOrFail := func(query string) gosql.Result {
+		if res, err := sqlDB.Exec(query); err != nil {
+			t.Fatal(err)
+		} else {
+			return res
+		}
+		return nil
+	}
+
+	// The sequence of events here exactly matches the test cases in
+	// docs/tech-notes/index-backfill.md. If you update this, please remember to
+	// update the tech note as well.
+	execOrFail("SET create_table_with_schema_locked=false")
+	execOrFail("SET use_declarative_schema_changer='off'")
+	execOrFail("CREATE DATABASE t")
+	execOrFail("CREATE TABLE t.kv (k int PRIMARY KEY, v char)")
+	execOrFail("INSERT INTO t.kv VALUES (1, 'a'), (3, 'c'), (4, 'e'), (6, 'f'), (7, 'g'), (9, 'h')")
+
+	// Start the schema change.
+	var finishedSchemaChange sync.WaitGroup
+	finishedSchemaChange.Add(1)
+	go func() {
+		execOrFail("CREATE UNIQUE INDEX vidx on t.kv(v)")
+		finishedSchemaChange.Done()
+	}()
+
+	// tempIndex: DELETE_ONLY
+	// newIndex   BACKFILLING
+	<-moveToTDelete
+	execOrFail("DELETE FROM t.kv WHERE k=9")       // new_index: nothing, temp_index: sees delete
+	execOrFail("INSERT INTO t.kv VALUES (9, 'h')") // new_index: nothing, temp_index: nothing
+
+	// Move to WRITE_ONLY mode.
+	// tempIndex: WRITE_ONLY
+	// newIndex   BACKFILLING
+	moveToTWrite <- true
+	execOrFail("INSERT INTO t.kv VALUES (2, 'b')") // new_index: nothing, temp_index: sees insert
+
+	// Pick our scan timestamp.
+	// tempIndex: WRITE_ONLY
+	// newIndex   BACKFILLING
+	moveToTScan <- true
+	execOrFail("UPDATE t.kv SET v = 'd' WHERE k = 3")
+	execOrFail("UPDATE t.kv SET k = 5 WHERE v = 'e'")
+	execOrFail("DELETE FROM t.kv WHERE k = 6")
+
+	// Begin the backfill.
+	moveToBackfill <- true
+
+	<-backfillDone
+	execOrFail("INSERT INTO t.kv VALUES (10, 'z')") // new_index: nothing, temp_index: sees insert
+	moveToTMerge <- true
+
+	finishedSchemaChange.Wait()
+
+	pairsPrimary := queryPairs(t, sqlDB, "SELECT k, v FROM t.kv ORDER BY k ASC")
+	pairsIndex := queryPairs(t, sqlDB, "SELECT k, v FROM t.kv@vidx ORDER BY k ASC")
+
+	if len(pairsPrimary) != len(pairsIndex) {
+		t.Fatalf("Mismatched entries in table and index: %+v %+v", pairsPrimary, pairsIndex)
+	}
+
+	for i, pPrimary := range pairsPrimary {
+		if pPrimary != pairsIndex[i] {
+			t.Fatalf("Mismatched entry in table and index: %+v %+v", pPrimary, pairsIndex[i])
+		}
+	}
+}
+
+type pair struct {
+	k int
+	v string
+}
+
+func queryPairs(t *testing.T, sqlDB *gosql.DB, query string) []pair {
+	rows, err := sqlDB.Query(query)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+
+	ret := make([]pair, 0)
+	for rows.Next() {
+		p := pair{}
+		if err := rows.Scan(&p.k, &p.v); err != nil {
+			t.Fatal(err)
+		}
+		ret = append(ret, p)
+	}
+	return ret
+}
+
+// TestIndexBackfillerComputedAndGeneratedColumns tests that the index
+// backfiller support backfilling columns with default values or computed
+// expressions which are being backfilled.
+//
+// This is a remarkably low-level test. It manually mucks with the table
+// descriptor to set up an index backfill and then manually mucks sets up and
+// plans the index backfill, then it mucks with the table descriptor more
+// and ensures that the data was backfilled properly.
+func TestIndexBackfillerComputedAndGeneratedColumns(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	// A test case exists to exercise the behavior of an index backfill.
+	// The case gets to do arbitrary things to the table (which is created with
+	// the specified tableName in setupSQL). The idea is that there will be a
+	// mutation on the table with mutation ID 1 that represents an index backfill.
+	// The associated job (which is created by the test harness for the first
+	// mutation), will be blocked from running. Instead, the test will manually
+	// run the index backfiller via a hook exposed only for testing.
+	//
+	// After the backfill is run, the index (specified by its ID) is scanned and
+	// the contents are compared with expectedContents.
+	type indexBackfillTestCase struct {
+		// name of the test case.
+		name string
+
+		// SQL statements to run to setup the table.
+		setupSQL  string
+		tableName string
+
+		// setupDesc should mutate the descriptor such that the mutation with
+		// id 1 contains an index backfill.
+		setupDesc        func(t *testing.T, ctx context.Context, mut *tabledesc.Mutable, settings *cluster.Settings)
+		indexToBackfill  descpb.IndexID
+		expectedContents [][]string
+	}
+
+	indexBackfillerTestCases := []indexBackfillTestCase{
+		// This tests a secondary index which uses a virtual computed column in its
+		// key.
+		{
+			name: "virtual computed column in key",
+			setupSQL: `
+CREATE TABLE foo (i INT PRIMARY KEY, k INT, v INT AS (i*i + k) VIRTUAL);
+INSERT INTO foo VALUES (1, 2), (2, 3), (3, 4);
+`,
+			tableName:       "foo",
+			indexToBackfill: 2,
+			// Note that the results are ordered by column ID.
+			expectedContents: [][]string{
+				{"1", "3"},
+				{"2", "7"},
+				{"3", "13"},
+			},
+			setupDesc: func(t *testing.T, ctx context.Context, mut *tabledesc.Mutable, settings *cluster.Settings) {
+				indexToBackfill := descpb.IndexDescriptor{
+					Name:         "virtual_column_backed_index",
+					ID:           mut.NextIndexID,
+					ConstraintID: mut.NextConstraintID,
+					Unique:       true,
+					Version:      descpb.LatestIndexDescriptorVersion,
+					KeyColumnNames: []string{
+						mut.Columns[2].Name,
+					},
+					KeyColumnDirections: []catenumpb.IndexColumn_Direction{
+						catenumpb.IndexColumn_ASC,
+					},
+					KeyColumnIDs: []descpb.ColumnID{
+						mut.Columns[2].ID,
+					},
+					KeySuffixColumnIDs: []descpb.ColumnID{
+						mut.Columns[0].ID,
+					},
+					Type:         idxtype.FORWARD,
+					EncodingType: catenumpb.SecondaryIndexEncoding,
+				}
+				mut.NextIndexID++
+				mut.NextConstraintID++
+				require.NoError(t, mut.AddIndexMutationMaybeWithTempIndex(&indexToBackfill, descpb.DescriptorMutation_ADD))
+				require.NoError(t, mut.AllocateIDs(context.Background(), settings.Version.ActiveVersion(ctx)))
+			},
+		},
+		// This test will inject a new primary index and perform a primary key swap
+		// where the new primary index has two new stored columns not in the existing
+		// primary index.
+		{
+			name: "default and generated column referencing it in new primary index",
+			setupSQL: `
+CREATE TABLE foo (i INT PRIMARY KEY);
+INSERT INTO foo VALUES (1), (10), (100);
+`,
+			tableName:       "foo",
+			indexToBackfill: 2,
+			expectedContents: [][]string{
+				{"1", "42", "43"},
+				{"10", "42", "52"},
+				{"100", "42", "142"},
+			},
+			setupDesc: func(t *testing.T, ctx context.Context, mut *tabledesc.Mutable, settings *cluster.Settings) {
+				columnWithDefault := descpb.ColumnDescriptor{
+					Name:           "def",
+					ID:             mut.NextColumnID,
+					Type:           types.Int,
+					Nullable:       false,
+					DefaultExpr:    proto.String("42"),
+					Hidden:         false,
+					PGAttributeNum: descpb.PGAttributeNum(mut.NextColumnID),
+				}
+				mut.NextColumnID++
+				mut.AddColumnMutation(&columnWithDefault, descpb.DescriptorMutation_ADD)
+				// Cheat and jump right to WRITE_ONLY.
+				mut.Mutations[len(mut.Mutations)-1].State = descpb.DescriptorMutation_WRITE_ONLY
+				computedColumnNotInPrimaryIndex := descpb.ColumnDescriptor{
+					Name:           "comp",
+					ID:             mut.NextColumnID,
+					Type:           types.Int,
+					Nullable:       false,
+					ComputeExpr:    proto.String("i + def"),
+					Hidden:         false,
+					PGAttributeNum: descpb.PGAttributeNum(mut.NextColumnID),
+				}
+				mut.NextColumnID++
+				mut.AddColumnMutation(&computedColumnNotInPrimaryIndex, descpb.DescriptorMutation_ADD)
+				// Cheat and jump right to WRITE_ONLY.
+				mut.Mutations[len(mut.Mutations)-1].State = descpb.DescriptorMutation_WRITE_ONLY
+
+				mut.Families[0].ColumnIDs = append(mut.Families[0].ColumnIDs,
+					columnWithDefault.ID,
+					computedColumnNotInPrimaryIndex.ID)
+				mut.Families[0].ColumnNames = append(mut.Families[0].ColumnNames,
+					columnWithDefault.Name,
+					computedColumnNotInPrimaryIndex.Name)
+
+				indexToBackfill := descpb.IndexDescriptor{
+					Name:         "new_primary_index",
+					ID:           mut.NextIndexID,
+					ConstraintID: mut.NextConstraintID,
+					Unique:       true,
+					Version:      descpb.LatestIndexDescriptorVersion,
+					KeyColumnNames: []string{
+						mut.Columns[0].Name,
+					},
+					KeyColumnDirections: []catenumpb.IndexColumn_Direction{
+						catenumpb.IndexColumn_ASC,
+					},
+					StoreColumnNames: []string{
+						columnWithDefault.Name,
+						computedColumnNotInPrimaryIndex.Name,
+					},
+					KeyColumnIDs: []descpb.ColumnID{
+						mut.Columns[0].ID,
+					},
+					KeySuffixColumnIDs: nil,
+					StoreColumnIDs: []descpb.ColumnID{
+						columnWithDefault.ID,
+						computedColumnNotInPrimaryIndex.ID,
+					},
+					Type:         idxtype.FORWARD,
+					EncodingType: catenumpb.PrimaryIndexEncoding,
+				}
+				mut.NextIndexID++
+				mut.NextConstraintID++
+				require.NoError(t, mut.AddIndexMutationMaybeWithTempIndex(&indexToBackfill, descpb.DescriptorMutation_ADD))
+				require.NoError(t, mut.AllocateIDs(context.Background(), settings.Version.ActiveVersion(ctx)))
+				mut.AddPrimaryKeySwapMutation(&descpb.PrimaryKeySwap{
+					OldPrimaryIndexId: 1,
+					NewPrimaryIndexId: 2,
+				})
+			},
+		},
+	}
+
+	// fetchIndex fetches the contents of an a table index returning the results
+	// as datums. The datums will correspond to each of the columns stored in the
+	// index, ordered by column ID.
+	fetchIndex := func(
+		ctx context.Context, t *testing.T, codec keys.SQLCodec, txn *kv.Txn, table *tabledesc.Mutable, indexID descpb.IndexID,
+	) []tree.Datums {
+		t.Helper()
+
+		mm := mon.NewStandaloneBudget(1 << 30)
+		idx, err := catalog.MustFindIndexByID(table, indexID)
+		colIDsNeeded := idx.CollectKeyColumnIDs()
+		if idx.Primary() {
+			for _, column := range table.PublicColumns() {
+				if !column.IsVirtual() {
+					colIDsNeeded.Add(column.GetID())
+				}
+			}
+		} else {
+			colIDsNeeded.UnionWith(idx.CollectSecondaryStoredColumnIDs())
+			colIDsNeeded.UnionWith(idx.CollectKeySuffixColumnIDs())
+		}
+
+		require.NoError(t, err)
+		spans := []roachpb.Span{table.IndexSpan(codec, indexID)}
+		var fetcherCols []descpb.ColumnID
+		for _, col := range table.PublicColumns() {
+			if colIDsNeeded.Contains(col.GetID()) {
+				fetcherCols = append(fetcherCols, col.GetID())
+			}
+		}
+		var alloc tree.DatumAlloc
+		var spec fetchpb.IndexFetchSpec
+		require.NoError(t, rowenc.InitIndexFetchSpec(
+			&spec,
+			codec,
+			table,
+			idx,
+			fetcherCols,
+		))
+		var fetcher row.Fetcher
+		require.NoError(t, fetcher.Init(
+			ctx,
+			row.FetcherInitArgs{
+				Txn:        txn,
+				Alloc:      &alloc,
+				MemMonitor: mm.Monitor(),
+				Spec:       &spec,
+				TraceKV:    true,
+			},
+		))
+
+		require.NoError(t, fetcher.StartScan(
+			ctx, spans, nil /* spanIDs */, rowinfra.NoBytesLimit, 0,
+		))
+		var rows []tree.Datums
+		for {
+			datums, _, err := fetcher.NextRowDecoded(ctx)
+			require.NoError(t, err)
+			if datums == nil {
+				break
+			}
+			// Copy the datums out as the slice is reused internally.
+			row := append(tree.Datums(nil), datums...)
+			rows = append(rows, row)
+		}
+		return rows
+	}
+
+	datumSliceToStrMatrix := func(rows []tree.Datums) [][]string {
+		res := make([][]string, len(rows))
+		for i, row := range rows {
+			rowStrs := make([]string, len(row))
+			for j, d := range row {
+				rowStrs[j] = d.String()
+			}
+			res[i] = rowStrs
+		}
+		return res
+	}
+
+	// See the comment on indexBackfillTestCase for the behavior of run.
+	run := func(t *testing.T, test indexBackfillTestCase) {
+		ctx := context.Background()
+
+		// Ensure the job doesn't actually run. The code below will handle running
+		// the index backfill.
+		blockChan := make(chan struct{})
+		var jobToBlock atomic.Value
+		jobToBlock.Store(jobspb.InvalidJobID)
+		s, db, _ := serverutils.StartServer(t, base.TestServerArgs{
+			Knobs: base.TestingKnobs{
+				SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
+					RunBeforeResume: func(jobID jobspb.JobID) error {
+						if jobID == jobToBlock.Load().(jobspb.JobID) {
+							<-blockChan
+							return errors.New("boom")
+						}
+						return nil
+					},
+				},
+			},
+		})
+		defer s.Stopper().Stop(ctx)
+		defer close(blockChan)
+
+		// Run the initial setupSQL.
+		tdb := sqlutils.MakeSQLRunner(db)
+		tdb.Exec(t, test.setupSQL)
+
+		// Fetch the descriptor ID for the relevant table.
+		var tableID descpb.ID
+		tdb.QueryRow(t, "SELECT ($1::REGCLASS)::INT", test.tableName).Scan(&tableID)
+
+		// Run the testCase's setupDesc function to prepare an index backfill
+		// mutation. Also, create an associated job and set it up to be blocked.
+		tt := s.ApplicationLayer()
+		lm := tt.LeaseManager().(*lease.Manager)
+		codec := tt.Codec()
+		settings := tt.ClusterSettings()
+		execCfg := tt.ExecutorConfig().(sql.ExecutorConfig)
+		jr := tt.JobRegistry().(*jobs.Registry)
+		var j *jobs.Job
+		var table catalog.TableDescriptor
+		require.NoError(t, sql.DescsTxn(ctx, &execCfg, func(
+			ctx context.Context, txn isql.Txn, descriptors *descs.Collection,
+		) (err error) {
+			mut, err := descriptors.MutableByID(txn.KV()).Table(ctx, tableID)
+			if err != nil {
+				return err
+			}
+			test.setupDesc(t, ctx, mut, settings)
+			span := mut.PrimaryIndexSpan(execCfg.Codec)
+			resumeSpanList := make([]jobspb.ResumeSpanList, len(mut.Mutations))
+			for i := range mut.Mutations {
+				resumeSpanList[i] = jobspb.ResumeSpanList{
+					ResumeSpans: []roachpb.Span{span},
+				}
+			}
+			jobID := jr.MakeJobID()
+			j, err = jr.CreateAdoptableJobWithTxn(ctx, jobs.Record{
+				Description:   "testing",
+				Statements:    []string{"testing"},
+				Username:      username.RootUserName(),
+				DescriptorIDs: []descpb.ID{tableID},
+				Details: jobspb.SchemaChangeDetails{
+					DescID:          tableID,
+					TableMutationID: 1,
+					FormatVersion:   jobspb.JobResumerFormatVersion,
+					ResumeSpanList:  resumeSpanList,
+				},
+				Progress: jobspb.SchemaChangeGCProgress{},
+			}, jobID, txn)
+			if err != nil {
+				return err
+			}
+			mut.MutationJobs = append(mut.MutationJobs, descpb.TableDescriptor_MutationJob{
+				JobID:      jobID,
+				MutationID: 1,
+			})
+			jobToBlock.Store(jobID)
+			mut.MaybeIncrementVersion()
+			table = mut.ImmutableCopy().(catalog.TableDescriptor)
+			return descriptors.WriteDesc(ctx, false /* kvTrace */, mut, txn.KV())
+		}))
+
+		// Run the index backfill
+		changer := sql.NewSchemaChangerForTesting(
+			tableID, 1, execCfg.NodeInfo.NodeID.SQLInstanceID(), execCfg.InternalDB, lm, jr, &execCfg, settings)
+		changer.SetJob(j)
+		spans := []roachpb.Span{table.IndexSpan(codec, test.indexToBackfill)}
+		require.NoError(t, changer.TestingDistIndexBackfill(ctx, table.GetVersion(), spans,
+			[]descpb.IndexID{test.indexToBackfill}, backfill.IndexMutationFilter))
+
+		// Make the mutation complete, then read the index and validate that it
+		// has the expected contents.
+		require.NoError(t, sql.DescsTxn(ctx, &execCfg, func(
+			ctx context.Context, txn isql.Txn, descriptors *descs.Collection,
+		) error {
+			table, err := descriptors.MutableByID(txn.KV()).Table(ctx, tableID)
+			if err != nil {
+				return err
+			}
+			toComplete := len(table.Mutations)
+			for i := 0; i < toComplete; i++ {
+				mut := table.Mutations[i]
+				require.NoError(t, table.MakeMutationComplete(mut))
+			}
+			table.Mutations = table.Mutations[toComplete:]
+			datums := fetchIndex(ctx, t, codec, txn.KV(), table, test.indexToBackfill)
+			require.Equal(t, test.expectedContents, datumSliceToStrMatrix(datums))
+			return nil
+		}))
+	}
+
+	for _, test := range indexBackfillerTestCases {
+		t.Run(test.name, func(t *testing.T) { run(t, test) })
+	}
+}
+
+// TestIndexBackfillerResumePreservesProgress tests that spans completed during
+// a backfill are properly preserved during PAUSE/RESUMEs. In particular,
+// we test the following backfill sequence (where b[n] denotes the same
+// backfill, just at different points of progression):
+//
+//	b[1] -> PAUSE -> RESUME -> b[2] -> PAUSE -> RESUME -> b[3]
+//
+// Before #140358, b[2] only checkpointed the spans it has completed since the
+// backfill was resumed -- leading to [b3] redoing work already completed since
+// b[1].
+func TestIndexBackfillerResumePreservesProgress(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	skip.UnderDeadlock(t, "slow timing sensitive test")
+	skip.UnderRace(t, "slow timing sensitive test")
+
+	ctx := context.Background()
+	// backfillProgressCompletedCh will be used to communicate completed spans
+	// with the tenant prefix removed, if applicable.
+	backfillProgressCompletedCh := make(chan []roachpb.Span)
+	const numRows = 100
+	const numSpans = 20
+	var isBlockingBackfillProgress atomic.Bool
+	var codec keys.SQLCodec
+
+	// Start the server with testing knob.
+	srv, db, _ := serverutils.StartServer(t, base.TestServerArgs{
+		Knobs: base.TestingKnobs{
+			JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
+			DistSQL: &execinfra.TestingKnobs{
+				// We want to push progress every batch_size rows to control
+				// the backfill incrementally.
+				BulkAdderFlushesEveryBatch: true,
+				RunBeforeIndexBackfillProgressUpdate: func(ctx context.Context, completed []roachpb.Span) {
+					if isBlockingBackfillProgress.Load() {
+						if toRemove := len(codec.TenantPrefix()); toRemove > 0 {
+							// Remove the tenant prefix from completed spans.
+							updated := make([]roachpb.Span, len(completed))
+							for i := range updated {
+								sp := completed[i]
+								updated[i] = roachpb.Span{
+									Key:    append(roachpb.Key(nil), sp.Key[toRemove:]...),
+									EndKey: append(roachpb.Key(nil), sp.EndKey[toRemove:]...),
+								}
+							}
+							completed = updated
+						}
+						select {
+						case <-ctx.Done():
+						case backfillProgressCompletedCh <- completed:
+							t.Logf("before index backfill progress update, completed spans: %v", completed)
+						}
+					}
+				},
+			},
+			SQLDeclarativeSchemaChanger: &scexec.TestingKnobs{
+				RunBeforeBackfill: func(progresses []scexec.BackfillProgress) error {
+					if progresses != nil {
+						t.Logf("before resuming backfill, checkpointed spans: %v", progresses[0].CompletedSpans)
+					}
+					return nil
+				},
+				AfterStage: func(p scplan.Plan, stageIdx int) error {
+					if p.Stages[stageIdx].Type() != scop.BackfillType || !isBlockingBackfillProgress.Load() {
+						return nil
+					}
+					isBlockingBackfillProgress.Store(false)
+					close(backfillProgressCompletedCh)
+					return nil
+				},
+			},
+		},
+	})
+	defer srv.Stopper().Stop(ctx)
+	s := srv.ApplicationLayer()
+
+	codec = s.Codec()
+	isBlockingBackfillProgress.Store(true)
+
+	_, err := db.Exec(`SET CLUSTER SETTING bulkio.index_backfill.batch_size = 10`)
+	require.NoError(t, err)
+	_, err = db.Exec(`SET CLUSTER SETTING bulkio.index_backfill.ingest_concurrency=4`)
+	require.NoError(t, err)
+	// Ensure that we checkpoint our progress to the backfill job so that
+	// RESUMEs can get an up-to-date backfill progress.
+	_, err = db.Exec(`SET CLUSTER SETTING bulkio.index_backfill.checkpoint_interval = '10ms'`)
+	require.NoError(t, err)
+	_, err = db.Exec(`CREATE TABLE t(i INT PRIMARY KEY)`)
+	require.NoError(t, err)
+	// Have a 100 splits each containing a 100 rows.
+	_, err = db.Exec(`INSERT INTO t SELECT generate_series(1, $1)`, (numRows*numSpans)+1)
+	require.NoError(t, err)
+	for split := 0; split < numSpans; split++ {
+		_, err = db.Exec(`ALTER TABLE t SPLIT AT VALUES ($1)`, numRows*numSpans)
+	}
+	require.NoError(t, err)
+	var descID catid.DescID
+	descIDRow := db.QueryRow(`SELECT 't'::regclass::oid`)
+	err = descIDRow.Scan(&descID)
+	require.NoError(t, err)
+
+	var jobID int
+	g := ctxgroup.WithContext(ctx)
+	g.GoCtx(func(ctx context.Context) error {
+		_, err := db.Exec(`ALTER TABLE t ADD COLUMN j INT NOT NULL DEFAULT 42`)
+		if err != nil && err.Error() != fmt.Sprintf("pq: job %d was paused before it completed", jobID) {
+			return err
+		}
+		return nil
+	})
+
+	testutils.SucceedsWithin(t, func() error {
+		jobIDRow := db.QueryRow(`
+				SELECT job_id FROM [SHOW JOBS]
+				WHERE job_type = 'NEW SCHEMA CHANGE' AND description ILIKE '%ADD COLUMN j%'`,
+		)
+		if err := jobIDRow.Scan(&jobID); err != nil {
+			return err
+		}
+		return nil
+	}, 30*time.Second)
+
+	ensureJobState := func(targetState string) {
+		testutils.SucceedsWithin(t, func() error {
+			var jobState string
+			statusRow := db.QueryRow(`SELECT status FROM [SHOW JOB $1]`, jobID)
+			if err := statusRow.Scan(&jobState); err != nil {
+				return err
+			}
+			if jobState != targetState {
+				return errors.Errorf("expected job to be %s, but found status: %s",
+					targetState, jobState)
+			}
+			return nil
+		}, 30*time.Second)
+	}
+
+	var completedSpans roachpb.SpanGroup
+	var observedSpans []roachpb.Span
+	receiveProgressUpdate := func() {
+		updateCount := 2
+		for isBlockingBackfillProgress.Load() && updateCount > 0 {
+			progressUpdate := <-backfillProgressCompletedCh
+			// Make sure the progress update does not contain overlapping spans.
+			for i, span1 := range progressUpdate {
+				for j, span2 := range progressUpdate {
+					if i == j {
+						continue
+					}
+					if span1.Overlaps(span2) {
+						t.Fatalf("progress update contains overlapping spans: %s and %s", span1, span2)
+					}
+				}
+			}
+			hasMoreSpans := completedSpans.Add(progressUpdate...)
+			if hasMoreSpans {
+				updateCount -= 1
+			}
+			observedSpans = append(observedSpans, progressUpdate...)
+		}
+	}
+
+	ensureCompletedSpansAreCheckpointed := func() {
+		testutils.SucceedsWithin(t, func() error {
+			stmt := `SELECT payload FROM crdb_internal.system_jobs WHERE id = $1`
+			var payloadBytes []byte
+			if err := db.QueryRowContext(ctx, stmt, jobID).Scan(&payloadBytes); err != nil {
+				return err
+			}
+
+			payload := &jobspb.Payload{}
+			if err := protoutil.Unmarshal(payloadBytes, payload); err != nil {
+				return err
+			}
+
+			schemaChangeProgress := *(payload.Details.(*jobspb.Payload_NewSchemaChange).NewSchemaChange)
+			var checkpointedSpans []roachpb.Span
+			if len(schemaChangeProgress.BackfillProgress) > 0 {
+				checkpointedSpans = schemaChangeProgress.BackfillProgress[0].CompletedSpans
+			}
+			var sg roachpb.SpanGroup
+			sg.Add(checkpointedSpans...)
+			// Ensure that the spans we already completed are fully contained in our
+			// checkpointed completed spans group.
+			if !sg.Encloses(completedSpans.Slice()...) {
+				return errors.Errorf("checkpointed spans %v do not enclose completed spans %v",
+					checkpointedSpans, completedSpans.Slice())
+			}
+
+			return nil
+		}, 30*time.Second)
+	}
+
+	for isBlockingBackfillProgress.Load() {
+		receiveProgressUpdate()
+		ensureCompletedSpansAreCheckpointed()
+		t.Logf("pausing backfill")
+		_, err = db.Exec(`PAUSE JOB $1`, jobID)
+		require.NoError(t, err)
+		ensureJobState("paused")
+
+		t.Logf("resuming backfill")
+		_, err = db.Exec(`RESUME JOB $1`, jobID)
+		require.NoError(t, err)
+		ensureJobState("running")
+	}
+	// Now we can wait for the job to succeed
+	ensureJobState("succeeded")
+	if err = g.Wait(); err != nil {
+		require.NoError(t, err)
+	}
+	// Make sure the spans we are adding do not overlap otherwise, this indicates
+	// a bug. Where we computed chunks incorrectly. Each chunk should be an independent
+	// piece of work.
+	for i, span1 := range observedSpans {
+		for j, span2 := range observedSpans {
+			if i == j {
+				continue
+			}
+			if span1.Overlaps(span2) {
+				t.Fatalf("progress update contains overlapping spans: %s and %s", span1, span2)
+			}
+		}
+	}
+}

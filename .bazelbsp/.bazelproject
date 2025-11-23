@@ -1,0 +1,6 @@
+# This project view file may be overwritten by the Bazel plugin.
+# To use it as default, place it in the Bazel module or workspace root directory.
+# For more options, see project view file documentation
+
+derive_targets_from_directories: true
+directories: .

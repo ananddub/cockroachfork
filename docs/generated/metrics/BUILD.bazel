@@ -1,0 +1,11 @@
+genrule(
+    name = "metrics",
+    outs = ["metrics.yaml"],
+    cmd = "$(location //pkg/cmd/cockroach-short) gen metric-list --logtostderr=NONE > $@",
+    tools = ["//pkg/cmd/cockroach-short"],
+    visibility = [
+        ":__pkg__",
+        "//pkg/gen:__pkg__",
+        "//pkg/roachprod/agents/opentelemetry:__pkg__",
+    ],
+)

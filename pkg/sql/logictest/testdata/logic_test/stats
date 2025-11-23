@@ -1,0 +1,124 @@
+# LogicTest: !fakedist-disk
+
+skip under race
+
+# Note that we disable the "forced disk spilling" config because the histograms
+# are dropped if the stats collection reaches the memory budget limit.
+
+# Regression test for using values outside of the range supported by the column
+# type for the histogram buckets (#76887).
+statement ok
+CREATE TABLE t (c INT2);
+
+# Insert many values so that the boundary values are likely to not be sampled.
+# Splitting the INSERT statement into two such that negative values are inserted
+# later for some reason makes it more likely that "outer" histogram buckets will
+# be needed.
+statement ok
+INSERT INTO t SELECT generate_series(1, 10000);
+INSERT INTO t SELECT generate_series(-10000, 0);
+
+statement ok
+ANALYZE t;
+
+# Get the histogram ID for column 'c'.
+let $histogram_id
+WITH h(columns, id) AS
+  (SELECT column_names, histogram_id from [SHOW STATISTICS FOR TABLE t])
+SELECT id FROM h WHERE columns = ARRAY['c'];
+
+# Run a query that verifies that minimum and maximum values of the histogram
+# buckets are exactly the boundaries of the INT2 supported range (unless -10000
+# and 10000 values were sampled).
+query B
+SELECT CASE
+  WHEN (SELECT count(*) FROM [SHOW HISTOGRAM $histogram_id]) = 2
+    THEN true -- if the sampling picked the boundary values, we're happy
+  ELSE
+    (SELECT min(upper_bound::INT) = -32768 AND max(upper_bound::INT) = 32767 FROM [SHOW HISTOGRAM $histogram_id])
+  END
+----
+true
+
+# Regression for not setting the TypeResolver on the SemaContext when dealing
+# with stats on virtual computed columns (#122312).
+statement ok
+CREATE TYPE greeting AS ENUM ('hello', 'hi', 'yo');
+
+statement ok
+CREATE TABLE t122312 (s STRING, g greeting AS (s::greeting) STORED);
+
+statement ok
+ANALYZE t122312;
+
+# Regression for not using the latest type metadata after the UDT modification
+# within the same txn (#129623).
+statement ok
+INSERT INTO t122312 VALUES ('hi');
+
+statement ok
+ANALYZE t122312;
+
+statement ok
+BEGIN;
+ALTER TYPE greeting ADD VALUE 'hey';
+SELECT * FROM t122312 WHERE g = 'hi';
+COMMIT;
+
+# Regression test related to #139381. Do not collect histograms on non-indexed
+# JSON columns by default.
+statement ok
+CREATE TABLE t139381 (
+  k INT PRIMARY KEY,
+  j JSON,
+  v STRING AS (j->>'name') VIRTUAL,
+  INDEX (v)
+)
+
+statement ok
+INSERT INTO t139381
+SELECT i, ('{"name": "name_' || i || '", "data": "abcdefghij"}')::JSONB
+FROM (VALUES (1), (2)) v(i)
+
+statement ok
+ANALYZE t139381
+
+query TT rowsort
+SELECT column_names, IF(histogram_id IS NOT NULL, 'histogram_collected', 'no_histogram_collected')
+FROM [SHOW STATISTICS FOR TABLE t139381]
+----
+{k}  histogram_collected
+{j}  no_histogram_collected
+{v}  histogram_collected
+
+# Histograms are collected on non-indexed JSON columns when the cluster setting
+# is enabled.
+statement ok
+SET CLUSTER SETTING sql.stats.non_indexed_json_histograms.enabled = true
+
+statement ok
+ANALYZE t139381
+
+query TT rowsort
+SELECT column_names, IF(histogram_id IS NOT NULL, 'histogram_collected', 'no_histogram_collected')
+FROM [SHOW STATISTICS FOR TABLE t139381]
+----
+{k}  histogram_collected
+{j}  histogram_collected
+{v}  histogram_collected
+
+# Regression test for inflating the distinct count due to including column ID
+# delta in the sketch (#141448).
+statement ok
+CREATE TABLE t141448 (i INT, f FLOAT, b BOOL);
+
+statement ok
+INSERT INTO t141448 VALUES (NULL, NULL, false), (NULL, 1, false), (1, 1, false);
+
+statement ok
+ANALYZE t141448;
+
+query II
+SELECT row_count, distinct_count FROM [SHOW STATISTICS FOR TABLE t141448] WHERE column_names = ARRAY['b'];
+----
+3  1

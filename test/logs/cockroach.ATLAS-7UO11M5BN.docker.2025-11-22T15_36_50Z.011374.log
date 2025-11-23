@@ -1,0 +1,38 @@
+I251122 15:36:50.815290 1 util/log/file_sync_buffer.go:237 ⋮ [config]   file created at: 2025/11/22 15:36:50
+I251122 15:36:50.815301 1 util/log/file_sync_buffer.go:237 ⋮ [config]   running on machine: ‹ATLAS-7UO11M5BN›
+I251122 15:36:50.815310 1 util/log/file_sync_buffer.go:237 ⋮ [config]   binary: CockroachDB CCL v26.1.0-alpha.1-dev (linux amd64, built , go1.25.3)
+I251122 15:36:50.815315 1 util/log/file_sync_buffer.go:237 ⋮ [config]   arguments: [‹./cockroach› ‹start-single-node› ‹--store=test›]
+I251122 15:36:50.815325 1 util/log/file_sync_buffer.go:237 ⋮ [config]   log format (utf8=✓): crdb-v2
+I251122 15:36:50.815330 1 util/log/file_sync_buffer.go:237 ⋮ [config]   line format: [IWEF]yymmdd hh:mm:ss.uuuuuu goid [chan@]file:line redactionmark \[tags\] [counter] msg
+I251122 15:36:50.814993 1 server/status/recorder.go:917 ⋮ [n?] 1  ‹available memory from cgroups (0 B) is unsupported, using system memory 80 GiB instead: no cgroup memory controller detected›
+W251122 15:36:50.816182 1 1@cli/start.go:1378 ⋮ [n?] 2  Using the default setting for --cache (256 MiB).
+W251122 15:36:50.816182 1 1@cli/start.go:1378 ⋮ [n?] 2 +  A significantly larger value is usually needed for good performance.
+W251122 15:36:50.816182 1 1@cli/start.go:1378 ⋮ [n?] 2 +  If you have a dedicated server a reasonable setting is --cache=.25 (20 GiB).
+I251122 15:36:50.816321 1 server/status/recorder.go:917 ⋮ [n?] 3  ‹available memory from cgroups (0 B) is unsupported, using system memory 80 GiB instead: no cgroup memory controller detected›
+I251122 15:36:50.816338 1 1@cli/start.go:1518 ⋮ [n?] 4  CockroachDB CCL v26.1.0-alpha.1-dev (linux amd64, built , go1.25.3)
+I251122 15:36:50.816676 1 server/status/recorder.go:917 ⋮ [n?] 5  ‹available memory from cgroups (0 B) is unsupported, using system memory 80 GiB instead: no cgroup memory controller detected›
+I251122 15:36:50.816701 1 1@cli/start.go:572 ⋮ [n?] 6  soft memory limit of Go runtime is set to 45 GiB
+I251122 15:36:50.816725 1 1@cli/start.go:609 ⋮ [n?] 7  GC target percentage of Go runtime is set to 300%
+I251122 15:36:50.817236 1 server/status/recorder.go:917 ⋮ [T1,Vsystem,n?] 8  ‹available memory from cgroups (0 B) is unsupported, using system memory 80 GiB instead: no cgroup memory controller detected›
+I251122 15:36:50.817254 1 server/config.go:676 ⋮ [T1,Vsystem,n?] 9  system total memory: 80 GiB
+I251122 15:36:50.817264 1 server/config.go:678 ⋮ [T1,Vsystem,n?] 10  server configuration:
+I251122 15:36:50.817264 1 server/config.go:678 ⋮ [T1,Vsystem,n?] 10 +max offset             500000000
+I251122 15:36:50.817264 1 server/config.go:678 ⋮ [T1,Vsystem,n?] 10 +cache size             256 MiB
+I251122 15:36:50.817264 1 server/config.go:678 ⋮ [T1,Vsystem,n?] 10 +SQL memory pool size   20 GiB
+I251122 15:36:50.817264 1 server/config.go:678 ⋮ [T1,Vsystem,n?] 10 +scan interval          10m0s
+I251122 15:36:50.817264 1 server/config.go:678 ⋮ [T1,Vsystem,n?] 10 +scan min idle time     10ms
+I251122 15:36:50.817264 1 server/config.go:678 ⋮ [T1,Vsystem,n?] 10 +scan max idle time     1s
+I251122 15:36:50.817264 1 server/config.go:678 ⋮ [T1,Vsystem,n?] 10 +event log enabled      true
+I251122 15:36:50.817315 1 1@cli/start.go:1356 ⋮ [T1,Vsystem,n?] 11  using local environment variables:
+I251122 15:36:50.817315 1 1@cli/start.go:1356 ⋮ [T1,Vsystem,n?] 11 +LANG=C.UTF-8
+I251122 15:36:50.817315 1 1@cli/start.go:1356 ⋮ [T1,Vsystem,n?] 11 +TERM=xterm-256color
+I251122 15:36:50.817328 1 1@cli/start.go:1363 ⋮ [T1,Vsystem,n?] 12  process identity: uid 1000 euid 1000 gid 1000 egid 1000
+W251122 15:36:50.817932 1 1@cli/start.go:1543 ⋮ [T1,Vsystem,n?] 13  could not initialize GEOS - spatial functions may not be available: geos: error during GEOS init: geos: cannot load GEOS from dir ‹"/usr/local/lib/cockroach"›: ‹geos error: /usr/local/lib/cockroach/libgeos.so: cannot open shared object file: No such file or directory›
+W251122 15:36:50.817932 1 1@cli/start.go:1543 ⋮ [T1,Vsystem,n?] 13 +HINT: ‹Ensure you have the spatial libraries installed as per the instructions in https://www.cockroachlabs.com/docs/dev/install-cockroachdb-linux›
+I251122 15:36:50.817987 1 1@cli/start.go:795 ⋮ [T1,Vsystem,n?] 14  starting cockroach node
+W251122 15:36:50.818712 92 1@storage/disk/platform_linux.go:114 ⋮ [-] 15  unsupported file system type 53464846 for path (0:15) ‹"/mnt/d/Devloper/cockroach/test"›
+W251122 15:36:50.819001 92 1@storage/disk/platform_linux.go:114 ⋮ [-] 16  unsupported file system type 53464846 for path (0:15) ‹"/mnt/d/Devloper/cockroach/test"›
+I251122 15:36:50.886825 1 1@cli/start.go:1052 ⋮ [T1,Vsystem,n?] 17  initiating hard shutdown of server
+I251122 15:36:50.886978 1 1@cli/start.go:1130 ⋮ [T1,Vsystem,n?] 18  too early to drain; used hard shutdown instead
+E251122 15:36:50.887376 1 1@cli/clierror/check.go:35 ⋮ [-] 19  ‹ERROR›: connection lost.
+E251122 15:36:50.887376 1 1@cli/clierror/check.go:35 ⋮ [-] 19 +server startup failed: failed to start server: failed to create engines: creating disk monitor: opening /proc/diskstats: open ‹/proc/diskstats›: no such file or directory

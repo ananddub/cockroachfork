@@ -1,0 +1,16 @@
+root 2.0 MiB (20 GiB / 0 B)
+    sql 1.6 MiB
+        session root 10 KiB (21 KiB / 84 KiB)
+            txn 10 KiB
+                flow-fbcc2bf5 10 KiB
+        session root 50 KiB (21 KiB / 84 KiB)
+            session 34 KiB
+                session prepared statements 4.0 KiB
+        conn 210 KiB
+        SQLStats 1.1 MiB
+    server-cache-mon 60 KiB
+    leased-descriptors 90 KiB
+    closed-session-cache 50 KiB
+    kv-mem 30 KiB
+        rangefeed-monitor 30 KiB
+        rangefeed-system-monitor 80 KiB (128 MiB / 0 B)

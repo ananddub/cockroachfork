@@ -1,0 +1,7 @@
+{
+    "watch": [
+        "pkg/sql"
+    ],
+    "ext": "go",
+    "exec": "bash ./nodemon-build.sh"
+}

@@ -1,0 +1,415 @@
+# LogicTest: 5node
+
+subtest scrub
+
+# TODO(radu): rework or remove these tests (the inner ORDER BY is ignored by
+# the optimizer).
+#
+# # Verify the index check execution plan uses a merge join.
+#
+# statement ok
+# CREATE TABLE test (k INT PRIMARY KEY, v INT, data INT, INDEX secondary (v) STORING (data))
+#
+# query T
+# EXPLAIN (DISTSQL)
+#     SELECT leftside.v, leftside.k, leftside.data, rightside.v, rightside.k, rightside.data
+#     FROM
+#       (SELECT v,k,data FROM test@{FORCE_INDEX=[1]} ORDER BY v,k,data) AS leftside
+#     FULL OUTER JOIN
+#       (SELECT v,k,data FROM test@{FORCE_INDEX=[2]} ORDER BY v,k,data) AS rightside
+#       ON leftside.v = rightside.v AND leftside.k = rightside.k AND leftside.data = rightside.data
+#     WHERE (leftside.k IS NULL) OR
+#           (rightside.k IS NULL)
+# ----
+# https://cockroachdb.github.io/distsqlplan/decode.html#eJyckc2K2zAQgO99CjGnLBlIJDs9CAq6dCFLGpdscio-uNY0a3AkM5Khy5J3L45hNw5x2vQ4I33zzc8bOG9pXRwogP4BEnKEhn1JIXjuUv2Hpf0Neo5QuaaNXTpHKD0T6DeIVawJNGyLnzVtqLDEszkgWIpFVZ_KNlwdCn41kUIEhKyNWhiFRqJJID8i-DZ-FA6x2BNoecR_lz97jsQzOfQaOUWjpmiS6ahG3aM5n1ENXYFK7-zdUyb_MWUyPiXCoYjli6jJaaFGremo9UPWOs-WmOzAlnfk375caf0b8Z6efOWIZ-mw_-1rQ1o87lYrke22XzfiKVuuAaGmX3FyNtzDF672L8MUIDxWdSTWYmKUWD6L9W61ehDZRkzM4j1-P4fE7iIJmhTNAs3n0Q0t7rnLhkLjXaDLTV2tPO_WQ3ZP_bqDb7mk7-zLk6YPsxN3SlgKsX-VfbB0_VPX4Dksb8LpAJaXsLoJJ7fNyR1mdQmnN-HFhTk_fvoTAAD__3P7gDg=
+#
+# # Verify the foreign key check execution plan uses a merge join.
+#
+# statement ok
+# CREATE TABLE parent (
+#   id INT PRIMARY KEY,
+#   id2 INT,
+#   UNIQUE INDEX (id, id2)
+# )
+#
+# statement ok
+# CREATE TABLE child (
+#   child_id INT PRIMARY KEY,
+#   id INT,
+#   id2 INT,
+#   FOREIGN KEY (id, id2) REFERENCES parent (id, id2)
+# )
+#
+# query T
+# EXPLAIN (DISTSQL)
+#     SELECT p.child_id, p.id, p.id2
+#     FROM
+#       (SELECT child_id, id, id2 FROM child@{NO_INDEX_JOIN} ORDER BY id, id2) AS p
+#     FULL OUTER JOIN
+#       (SELECT id, id2 FROM parent@{FORCE_INDEX=[2]} ORDER BY id, id2) AS c
+#       ON p.id = c.id AND p.id2 = c.id2
+#     WHERE (p.id IS NOT NULL OR p.id2 IS NOT NULL) AND
+#           c.id IS NULL AND c.id2 IS NULL
+# ----
+# https://cockroachdb.github.io/distsqlplan/decode.html#eJycklFrnTAUx9_3KcJ58nID1bi9BAYZbAWL0-G8T0PEmXNtqEskidBS_O7DCGstvRvdY345__wO5-QRtJFYdL_QAf8BCTQUJmt6dM7YFW0FmbwHHlNQepr9ihsKvbEI_BG88iMCh7r7OWKFnUR7FQMFib5TY3i2v1WjbLvZm1Zpifft-a5VsrV4bqfOovYiVECzUDCzf3I43w0IPFno__WR7PvYZKtaSdbe4YPYyEUxuyh-8s3aWIkW5c7VrMl_lbzS_Ve0A94YpdFesX339cOEnFyf8pyUp_pLRW7KrAAKI559JNiRivR4-GjVcOsjkRypYMcDULhWo0fLSRRFgpHsOynKmhSnPD-QsiKRSHfsQD4Vn0kk3gf6nHz4Q4BCOXtOREIFoyK9OL70LXur0E1GO3w5xldfjtfZoRxw24Uzs-3xmzV90GzHMuQCkOj8dsu2Q6bDVfhYz8PJG8LsZZj9NZzuwvHSLO9-BwAA__9_viDb
+
+subtest stats
+
+statement ok
+CREATE TABLE data (a INT, b INT, c FLOAT, d DECIMAL, PRIMARY KEY (a, b, c, d))
+
+# Split into ten parts.
+statement ok
+ALTER TABLE data SPLIT AT SELECT i FROM generate_series(1, 9) AS g(i)
+
+# Relocate the ten parts to the five nodes.
+retry
+statement ok
+ALTER TABLE data EXPERIMENTAL_RELOCATE
+  SELECT ARRAY[i%5+1], i FROM generate_series(0, 9) AS g(i)
+
+# Verify data placement.
+query TTTI colnames,rowsort
+SELECT start_key, end_key, replicas, lease_holder FROM [SHOW RANGES FROM TABLE data WITH DETAILS]
+ORDER BY 1
+----
+start_key           end_key       replicas  lease_holder
+<before:/Table/76>  …/1/1         {1}       1
+…/1/1               …/1/2         {2}       2
+…/1/2               …/1/3         {3}       3
+…/1/3               …/1/4         {4}       4
+…/1/4               …/1/5         {5}       5
+…/1/5               …/1/6         {1}       1
+…/1/6               …/1/7         {2}       2
+…/1/7               …/1/8         {3}       3
+…/1/8               …/1/9         {4}       4
+…/1/9               <after:/Max>  {5}       5
+
+query T
+EXPLAIN (DISTSQL) CREATE STATISTICS s1 ON a FROM data
+----
+distribution: full
+vectorized: false
+·
+• create statistics
+·
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJy0lV9vozgUxd_3U1j3pa1kBAbyj6dGbapFapJujLS7GkWVC7cpKsEZ26jtVPnuI5LJtGEalCDBAwKDz_2do2vdd9DfMwhg9N_d7TCckPPrkEf8n9sLcjUbDaMR4dEwCnkUXnGiGZlOiCA3s-mYJMII8m8Y_U2md1E4nXAy5GR6Q_j_PBqNSRSOR-TMYoU-Awq5THAilqgh-AYMKLhAwQMKPlDowJzCSskYtZaq_OV9syFMXiFwKKT5qjDl8pxCLBVC8A4mNRlCAJF4yHCGIkFlO0AhQSPSbFOmBLwsb_erZ3wDClcyK5a5DogACnwlykfLZkTkCWFEmidUQCHMY5nrVBvMDdGxyMn5UrwSo4lYIOksHX0B8zUFWZgPLG3EAiFgn3yE1xA4a3q8FS6WqwyV3dm3sV3m6Q8MCHMcp3TJjTABuWQHQdwKSOcgyEf9IpcqQYXJXv35-iDqcLFQuBBGKps5x0OTc9dxyEMRP6OpydKrWGD7YbLj-4I16AubWbbbYmewU8zsOqPbQmd090Dc41N1m6TqWrbXYqruKWZ2qfZaSLW3B-Idn6rXJFXPsv0WU_VOMbNLtd9Cqv09EP_4VP0mqfqW3WkxVf8UM7tUBy2kOjhlSM1Qr2SusTIjvq7kVCpZrBwmmCxwO3m0LFSMd0rGm3-3r9ON0GYhQW22X9n2Jcx3n7RRKJa_Z-xnJVar5O4psc9KnaqSW890CpRXK-UfVmJVJb-pvW5VqVOr1D3M5FaVuk2ZelWlXq1S_zCTV1XqN2XqV5UG9W3gHIby_-jN-javoRqUR-cxky_3aQIBOL8u64vb7oJyg1jo8vzyJ_mykY3eVuXpexSZRgpj8YzXaFAt0zzVJo0hMKrA9fqvnwEAAP__bD7lOg==
+
+statement ok
+INSERT INTO data SELECT a, b, c::FLOAT, 1
+FROM generate_series(1,10) AS a, generate_series(1,10) AS b, generate_series(1,10) AS c;
+
+query T
+EXPLAIN ANALYZE (DISTSQL) CREATE STATISTICS s1 ON a FROM data
+----
+planning time: 10µs
+execution time: 100µs
+distribution: <hidden>
+vectorized: <hidden>
+plan type: custom
+rows decoded from KV: 1,000 (7.8 KiB, 2,000 KVs, 1,000 gRPC calls)
+maximum memory usage: <hidden>
+DistSQL network usage: <hidden>
+regions: <hidden>
+isolation level: serializable
+priority: normal
+quality of service: regular
+·
+• create statistics
+·
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJzsllFvo0YQx9_7KUbzchcJBxaw4_B0qS-nWifHkUFXVVV02sAch4xZursoSSN_rH6BfrIKCI1NjWssWXcP5wfk3R1m_n_mt6t9RvVHih5OFtdXwTX4wVUw9YPpxAfFYH4DHD4s5jOIuObw6zT4Bea3wXR-48OVD_MP4P_mB9czCKaza3gzYIV6gwZmIqIbviKF3u_I0EAbDXTQQBcNHOKdgbkUISklZBnyXL0wjR7RswxMsrzQ5fSdgaGQhN4z6kSnhB4G_D6lBfGIpGmhgRFpnqRVmVLgu_LxOV_SExo4EWmxypQHHA30c17-HZgMeBYBA6G_kkQDp1koMpUoTZkGFfIM3q74I2gFPCYYrix1hgZ-_ASlROVBxuqhpDgRZUpNStdTOlmRB9bff6mXEPGgIKJQRBR5wCyrnr5_0qRAEo88GFsW_FxPx4vbCYQ8TdVGbM4T2cTa1eTs02QCSlMOoSgyDW_pUZtJps88sMzXAKJlV0AlSxQ6L3Rd6W5tYD1--epK85jQYxttmr5Hz1obh3fK56s8JWkOt7tUT_vJn1TVriz5mmsP3rFOIXZLyLBTyGv9IhMyIknRVv27dafUqziWFHMtpMmsw0XDW9uy4L4Il6TVWacFp2WBbX9Mdjj27AjsTTYw7W8Fvr0LfHY-go_JDvTtXei7p0Df7oE-69OtBv3RCdAfbQmxD8fGPgYbe2A6P7A5Hhu7T7cabC5OgM3FlhDncGycY7BxBqb7A5vjsXH6dKvBZnwCbMZbQtzDsXGPwcYdmMNvhY2zCxv73NmNjbMLm9EpsHF6YOP26VaDzeUJsLnsc1FckMpFpqh1T9tdyWpVGrDyQkdRTPXtT4lChnQrRVjF1sN5laiaiEjpepXVg2nWLCktia_-veduZmJ7M9lbmdhmpmE7k71fUx9Rzt5Ubncm1s7k9rXHq65gRvpByGW9kxRl1SlXbsBmod5L9crrEdysrkgpHr8GlKRv6hy1dQ736hx1O7bbmUbfp-OLts6LvTrH3Y6ddqbx9-l43NZ5uX-DWN2W3f_s2v0HQC_PTqdn-9z9H8_DlufL8sj6koqHz0mEHlovv8GOR_PD8gUeq_Lc9L-Kh0p08JSXp94XnioycMaX9J40yVWSJUonIXpaFrRe__RPAAAA__9ivap6
+
+# Clear the stat cache so that creating partial statistics has access to the
+# latest full statistic.
+statement ok
+SELECT crdb_internal.clear_table_stats_cache();
+
+query T
+EXPLAIN (DISTSQL) CREATE STATISTICS s1_constrained ON a FROM data WHERE a > 5
+----
+distribution: full
+vectorized: false
+·
+• create statistics
+·
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJy0ld9Oo0AUh-_3KU7OjZpM0wH6T65stEYS27qFxN3sNmaEY5dIGXZmiLqm776htbuFWNI2ygUpnJkf3_k6MK-ofyfo4uDbzXXfG8HxhecH_tfrEzifDPrBAPygH3h-4J37oK27UKbaKBGnFMF4BAIuJ-MhRMIIuPWCKxjfBN545MPt1WAyAAE_c84dgjb0fRhfgv_dDwZDCLzhAI4aVq6PkGEqIxqJOWl0f6CFDG1k6CDDFjJs45RhpmRIWktVDHldTvCiZ3Q5wzjNcrO6bWKTELqYp1JFpChChhEZESdFfbqYMgylInT_D_XFPEuoP5spmgkjVbNXmvNW9-M_5ILFOefI0DfCuHBmwbHNOdzn4SMZfYLTBUOZmzeaKUNtxIzQdTbwvQt0ewu20YG10cE7fIG4T2hCIiLV5GW0wvlZcbrLHukFGZ7LJJ-n2gVRQGai-NnsNJpdZOilxR8Xa0OpAR2KFI7n4hmMBjEjaM95TQNWpQG-TwMrgarZ2t3rVhC7AtIqgdi7m7QOMdltLBfHR5q09mlgbbL9CSbbJRBnd5P2ISZ7jebpB5u092lgbbLzCSY7JZDW7iadQ0yeNj7Yo7MP_tpj9xM8dksgvB5kQjqTqabK9_79J_HKkxpWsTFQNKPVLqJlrkK6UTJcjl1djpdByxsRabOqnq4uvHRd0kaRmP_7Rm4mWbVJ9h5Jdm0SLyVZm0mtapJTm9TazmRVk1qHMrWrSe3apM52Jrua1DmUqVNN6tYm9bYzOdWk3qFM3WKNPiTy6S6O0EX-djTeOa0PLCaImS5eFP-XfFrGBi9ZscwfRKKJ4VA80gUZUvM4jbWJQ3SNymmx-PI3AAD__14XPrY=
+
+query T retry
+EXPLAIN (DISTSQL, TYPES) SELECT * FROM data
+----
+distribution: full
+vectorized: true
+·
+• scan
+  columns: (a int, b int, c float, d decimal)
+  estimated row count: 1,000 (100% of the table; stats collected <hidden> ago)
+  table: data@data_pkey
+  spans: FULL SCAN
+·
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJyklEFvmz4UwO__T2G903-TERjIDpw2NZmElKZZ4LBpiioXv6aogJlt1FUR330ydGtBSYWID5bs5_zeLw8_H0H_KiCC1fft-ku8If8v4yRNvq0pSX9sV8kHkqzWq6uUfCRfdzfXRHDDgUIlBW54iRqin8CAgg8UAqAQAoUF7CnUSmaotVT2yLH7QSx-Q-RRyKu6MXZ7TyGTCiE6gslNgRBByu8K3CEXqFwPKAg0PC-6NDb1Zzvd1o_4DBSuZNGUlY4Ip-SOkowSARSSmts9x2WEV4IwIs0DKti3FGRjXjNrww8IEXujGi8h8lp6xvZVsqmkEqhQDAXzygB9me8LyU0XzvKSF7BvT_zZjXRk7S4GlHOe_shzMfBk06vKLqmqyxzXn1VXNvD1p_v6F_n6jhvM8vUHvsF03-Ai38Bxw1m-wcA3nO4bXuQbOu5ilm94ts9O-O5Q17LSOKlTvFEmh9neQ3HAvou1bFSGWyWz7my_vOlA3YZAbfoo6xdx1YWYzaCQl_-eibck9i7p04DkvUvy5zqxMSmYS_LHpHAuKRiTFnNJof2K94V8us0FROC9DOfE9Hd07zA_aHuVkgf51GHT59peBKMapHDNH3GJBlWZV7k2edYH2va_PwEAAP__DBRFDg==
+
+# Check that we properly render virtual computed columns when collecting stats.
+statement ok
+ALTER TABLE data ADD COLUMN e INT AS (b + 1) VIRTUAL
+
+statement ok
+CREATE INDEX ON data (e)
+
+query T
+EXPLAIN ANALYZE (DISTSQL) CREATE STATISTICS s1 FROM data
+----
+planning time: 10µs
+execution time: 100µs
+distribution: <hidden>
+vectorized: <hidden>
+plan type: custom
+rows decoded from KV: 1,000 (7.8 KiB, 2,000 KVs, 1,000 gRPC calls)
+maximum memory usage: <hidden>
+DistSQL network usage: <hidden>
+regions: <hidden>
+isolation level: serializable
+priority: normal
+quality of service: regular
+·
+• create statistics
+·
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJzsV91uo0gTvf-eolQ3k9HXDjRgx-EqWU9Ga43yI4NmtVpFow7UeFAwzXY3SrJRHmtfYJ9sBYSNYYzHKIqUSOMLRFcV1XWqTh-r71H_maKPs8XJcXgCQXgczoNwPgtAc_i4OD-FWBgBv83DX-H8IpyfnwVwHMD5Rwh-D8KTUwjnpyfwbsQL_Q4ZZjKmM7Eijf4fyJGhgwxdZOghwzFeMsyVjEhrqcqQ--qDeXyLvs0wyfLClOZLhpFUhP49msSkhD6G4iqlBYmYlGUjw5iMSNJqm7LAo_LxJb-mO2Q4k2mxyrQPgsEVg4hBjAyDXJS2kcVBZDFwkOYbKWQ4zyKZ6UQbygzoSGSwtxK3YDSIJcF4Zev3yHBBWUzKhyPO4MhhcOQyOPLK9_9z3_fnZ-EUGX76DCUi7UPG66WiZSLLjQ1pU5tMsiIf7H_-1o8h8kZDTJGMKfaB23ZtvrozpEGRiH2Y2jb8UpuXi4sZRCJN9VpsLhLVxDqV8fTzbAbaUA6RLDIDe3RrrCQz732wracAouu-gKosWZi8MPVOlw8M6_XjkLQRS0Kfr011_gF9-4HtPthArPKUlDVuD7U2B8lfVO1dQQqMMOUAnl6dNStbX7ltB1s3eN_52Lpt3IvT6eAc9-J8gldkUsWkKG7Bu3zo7cTxcqloKYxUFrd37wnsObYNV0V0Tabia9OhPkenX9vC2t37QWS7l53gvs66nc7yNoX47trAn6MNFh9ZzutWB2eTOvD9CXxKNuiDs0kfvJfQB2eAPvAhw230YfL29GHSwunsTmLnWSR2Rpb7k8QvTWJnyHAbEh-8PRIftHC6u5PYfRaJ3ZHl_STxS5PYHTLchsTTt0fiaQuntzuJvWeR2BtZ49dNYncTiZ19dzOJ3U0knrwEid0BJPaGDLch8eHbI_HhkGvVgnQuM02da8fmnezOTiNe3k8oXlJ9mdGyUBFdKBlVsfXyvEpUGWLSpvbyejHPGpc2isTqv1vheia-NZPTysTXM427mZztNQ0pyt2ayuvPxLuZvKHwRDUVzMjcSHVdH1RNWSXp5XFvHPVRrT1P_zeNd0Vai-VTgO3h5Xqdk26d4611TvoRO91Mk9eJ-KBb58HWOqf9iN1upunrRDzt1nm4_YDY_ZC9707tdgEYhNntxezsez_APO5gPiwl62sqb74kMfpoP_5GGx7ND8sPxFKXuhl8kzdV0eFdXqreV5FqYngqrukDGVKrJEu0SSL0jSro4eF__wYAAP__SYh9qQ==
+
+query T
+EXPLAIN ANALYZE (DISTSQL) CREATE STATISTICS s1 ON c, e, a FROM data
+----
+planning time: 10µs
+execution time: 100µs
+distribution: <hidden>
+vectorized: <hidden>
+plan type: custom
+rows decoded from KV: 1,000 (7.8 KiB, 2,000 KVs, 1,000 gRPC calls)
+maximum memory usage: <hidden>
+DistSQL network usage: <hidden>
+regions: <hidden>
+isolation level: serializable
+priority: normal
+quality of service: regular
+·
+• create statistics
+·
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJzsV9Fu2zYUfd9XXNyXthhdiZLsOHxy5qaYUCQOLKHDMAQFI92qQmRRI2kkWeDP2g_sywZJcWtrtmEHc5GH6kEAL68Oz9U9hyAf0fxZoMDx9PwsPocoPovDKA7HERgOk0tIGBADCe-nkwtIpZXwWxj_CpOrOJxcRnAWweQ9RL9H8fkFxOHFObzq8bl5hQxLldKlnJFB8QdyZOghQx8ZBsiwj9cMK60SMkbpOuWx-SBM71G4DPOymts6fM0wUZpQPKLNbUEoMJY3BU1JpqQdFxmmZGVeNMvUBEf161N1Sw_IcKyK-aw0AiSrS7lBhlEl60DP4SDLFDgo-4U0MgzLRJUmN5ZKCyaRJbyeyXuwBmRG0J-55g0ynFKZkhYw4gxGHoOR_zMXQoSX8RAZfvgIdRlGQMnboaYsV_WCloxtQzafkQD3n7_NU4q6M5BSolJKBXDXbcM3D5YMaJKpgKHrwi9tOJtejSGRRWFWciuZ62Wu1wQvPo7HYCxVkKh5aeE13VsnL-0bAa7zLYHodltCQ0vNbTW37UrXC4bt-KkzxsqMUPCVVobvULgLtn83IzmrCtJOf72TbTjK_6r_VN01K23z00ceG_lbqXgdKv2tVL4xmJdKp6QpXWNwvdhK9izLNGXSKu1w93-h7Xdo8_VfyPc3BH-2IRzec7yXaQlvkyX42wF8yDeYwttkiuAYpvAOMAU_pKNLUwyOYorBGhVvf3F5zxeX13P8H-I6lri8Qzq6FNfJUcR1skbF319c_vPF5fec4Ie4jiUu_5COLsU1PIq4hmtUgv3FFTxfXEHP6b9McfmbxOW99TeLy98krsExxOUfIK7gkI4uxXV6FHGdHnJsnZKpVGmoc2bcvJLbWanH68MlpRm1J1Gj5jqhK62SJrcdThqgJpCSse0sbwdhuZwyVpOcfT11ryLxnUjeGhJfRep3kbzdnA4h5e-ECrYj8S5ScGh5sukKlmTvlL5tvWSorC839XX1Kdx6qY0PmzvXcmZGxsjs66SL16v8Bl1-_Z38Btsr9bpIg5dV6UmX38lOfsPtlfpdpOHLqnTY5Xe62wju9lKD_7hzt9G_e62n9Zb0uVB3n_IUBbpPT2_Da_lg_YHMTL0vRl_UXUM2fqjqXe2zLAwxvJC39I4s6Vle5sbmCQqr57RY_PRvAAAA__9L1c6D
+
+query T
+EXPLAIN ANALYZE (DISTSQL) CREATE STATISTICS s1 ON e FROM data
+----
+planning time: 10µs
+execution time: 100µs
+distribution: <hidden>
+vectorized: <hidden>
+plan type: custom
+rows decoded from KV: 1,000 (7.8 KiB, 2,000 KVs, 1,000 gRPC calls)
+maximum memory usage: <hidden>
+DistSQL network usage: <hidden>
+regions: <hidden>
+isolation level: serializable
+priority: normal
+quality of service: regular
+·
+• create statistics
+·
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJzsVtFuo8gSfb9fUaqXSXRxoAE7Dk-T9WS0aOQ4MmhWq1U06kANg4xptrtRko38WfsD-2UrIN7YrPGaaCzlYfyA3NVF1TnUOa1-QvV7hh5O5leX4RUE4WXoB6E_CUAxmF0Dwcf5bAox1xx-8cOfYXYT-rPrAC4DmH2E4NcgvJpC6E-v4N2AleodGpiLmK75khR6vyFDA2000EEDXTRwiLcGFlJEpJSQVcpT_YIfP6BnGZjmRamr8K2BkZCE3hPqVGeEHob8LqM58ZikaaGBMWmeZnWbCuD76vGlWNAjGjgRWbnMlQd3aGBQ8OrvwGTA8xgYCP2NJBro55HIVao05RpUxHM4WfIH0Ap4QjBcWuoUDZxTHpP04D37P_M8z78Ox2jgp89QAVce5KxZSkpSUTXSpHQT0umSPLD--lM9p4h7BTFFIqbYA2ZZTfjuUZMCSTz2YGxZ8FMTTuY3E4h4lqmN3IKncp1r18Hp58kElKYCIlHmGk7oQZtprk89sMyXBKJFV0INS5S6KHXT6XZlYLN-noXSPCH02Mbw_A_oWSvj8PkFfFlkJM3h9uyacJD-QXXvmlKgua4-eCcQuwVk2AnkpX-ZCxmTpHir_-2qE-plkkhKuBbSZNbhoOHEtiy4K6MFaXXaScFpUWDbH5Mdbgb2CjOYbGDab8sO9i47sLMRfEp3GMLeZQj3GIawexiC9Znh2hCjIxhitAXEPlxM9mvEZA9M54eYvreY7D4zXIvp_AhiOt8C4hwuJuc1YnIGpvtDTN9bTE6fGa7FND6CmMZbQNzDxeS-RkzuwBy-LTE5u8Rknzm7xeTsEtPoGGJyeojJ7TPDtZgujiCmiz4X0DmpQuSKWve_3Z2sVqcBqy6KFCfU3CqVKGVEN1JEdW6znNWF6kBMSje7rFn4-XpLaUl8-c_9ebMS21vJ3qrENisN25Xs_Zj6gHL2lnK7K7F2JbcvPV5PBXPS90IuGicpyuuzrzLgeqPxUrPzcjCvd5ekFE9eEiqlb-IctXEO9-IcdTO225VGb5PxeRvn-V6c427GTrvS-G0yHrdxXuw3iNVN2f2Xa_cfAL04O52c7TP3PzgPW5wvqiPraybuv6Qxemg9_wY7HusfVi_wRFXnZvBN3Negw8eiOvW-8kyRgVO-oA-kSS7TPFU6jdDTsqTV6n9_BwAA__86c8dr
+
+statement ok
+ALTER TABLE data ADD COLUMN f FLOAT AS (atan2d(c, d::float)) VIRTUAL
+
+query T
+EXPLAIN ANALYZE (DISTSQL) CREATE STATISTICS s1 ON f, e, d FROM data
+----
+planning time: 10µs
+execution time: 100µs
+distribution: <hidden>
+vectorized: <hidden>
+plan type: custom
+rows decoded from KV: 1,000 (7.8 KiB, 2,000 KVs, 1,000 gRPC calls)
+maximum memory usage: <hidden>
+DistSQL network usage: <hidden>
+regions: <hidden>
+isolation level: serializable
+priority: normal
+quality of service: regular
+·
+• create statistics
+·
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJzsV9Fu2zYXvv-f4uDcNMVPV6IkOw6vnLkJJnSJA0voMAxBwUgnqhBZ1EgaSRbksfYCe7JBUtzGmm3YwRy0QHUhgIdHh9_R930E-YDmjwIFjqcnx_EJRPFxHEZxOI7AcJicwzUDYpDC6XRyBqm0En4N459hchGHk_MIjiOYnEL0WxSfnEEcnp3Amx6fmzfIsFQpncsZGRS_I0eGHjL0kWGADPt4ybDSKiFjlK5THpoPwvQOhcswL6u5rcOXDBOlCcUD2twWhAJjeVXQlGRK2nGRYUpW5kWzTA1wVL8-VTd0jwzHqpjPSiMgZXDFIEGGUSXrQM_hIMsUOCj7mTQyDMtElSY3lkoLJpElHMzkHVgDMiPoz1zzFhlOqUxJCxhxBiPv_1wIEZ7HQwbSytJLD0Y-G3EhTn-ZHMfD-oMPH6HuzAgoeTvUlOWqxmDJ2DZk8xkJcP_-yzylqFsDKSUqpVQAd902fHVvyYAmmQoYui781Iaz6cUYElkU5lluJXO9yPWa4NnH8RiMpQoSNS8tHNCddfLSvhXgOl8TiG7WJTSw1NxWc9uudPnIsB0_kWWszAgFf8Zu-B6F-8i2JziSs6og7fSXyW3DUf5n_adqIq20DQ8jj438tVC8DpT-WihfEcxLpVPSlC4huHxcC_Y4yzRl0irtcPc_ge13YPPlX8i39wh_sUcc3nO878Yl3iqX8HcD-JCv8Im3yifBPnzi7eATvgvJC58M9uKTwRIUb3u9eS_Xm9dz_B96e0W9ebuQvNDb4V70drgExd9eb_7L9eb3nOCH3l5Rb_4uJC_0NtyL3oZLUILt9Ra8XG9Bz-l_N3rzV-nNe-ev1pu_Sm-DfejN30FvwS4kL_R2tBe9He1yBJ6SqVRpqHP-XL2S21mpx-uDKqUZtadao-Y6oQutkia3HU6aQk0gJWPbWd4OwnIxZawmOftygn9eiW-s5C1V4s8r9buVvM2YdgHlbywVrK_Eu5WCXduTDStYkr1V-qb1kqGyvijVt-GncOulNj5s7m-LmRkZI7Mvky5ePsc36OLrb8Q3WN-p1600-LY6PeziO9yIb7i-U79bafhtdTrs4jvabAR3favBv9y52eiv3utRvSVdF-r2U56iQPfp6a14LR6sP5CZqffF6LO6bcDG91W9q13LwhDDM3lD78mSnuVlbmyeoLB6To-P__snAAD__-Jt6Qo=
+
+statement ok
+CREATE TYPE gh AS (g INT, h INT)
+
+# Try a virtual computed column whose expression cannot be distributed.
+statement ok
+ALTER TABLE data ADD COLUMN g gh[] AS (array_cat(ARRAY[(1, 2)], ARRAY[(a, b)])::gh[]) VIRTUAL
+
+# Error if we specify the problematic virtual computed column directly.
+statement error cannot be executed with distsql
+CREATE STATISTICS s1 ON g FROM data
+
+# We should skip the problematic virtual computed column when using defaults.
+query T
+EXPLAIN ANALYZE (DISTSQL) CREATE STATISTICS s1 FROM data
+----
+planning time: 10µs
+execution time: 100µs
+distribution: <hidden>
+vectorized: <hidden>
+plan type: custom
+rows decoded from KV: 1,000 (7.8 KiB, 2,000 KVs, 1,000 gRPC calls)
+maximum memory usage: <hidden>
+DistSQL network usage: <hidden>
+regions: <hidden>
+isolation level: serializable
+priority: normal
+quality of service: regular
+·
+• create statistics
+·
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJzsV-Fu2zYQ_r-nONyfphhdiZTsOPzlzE0wo0scWEKHYQgKRrq6QmzRI2kkWZDH2gvsyQZJ8WyrlmsjKFoD9Q9BvDsd77v7-Bl8RPvXBCX2R2en8RlE8Wk8iOJBPwLL4Xw0vIBUOQW_D-JfYXgVD4aXEZxGMDyH6I8oPruAeHBxBq9afG5fIcNcp3SppmRR_okcGQpkGCDDEBm28ZrhzOiErNWmCHksPxik9yh9hlk-m7vCfM0w0YZQPqLL3IRQYqxuJjQilZLxfGSYklPZpNymKLBXPD7MbukBGfb1ZD7NrQTF4IZBwiBFhtFMFbaWx0HlKXDQ7hMZZDjIE53bzDrKHdhE5XA0VffgLKgxQXvq29fIcER5SkZCjzPoCQa9gEEvLN5_5lLKwWXcZaCcykV61AtYL5Ty_LfhadwtPn73HgqgVkLOq6WhcaaLehxZV5lcNiUJ_r__2OcQfWchpUSnlErgvl-Zbx4cWTCkUgld34dfKvN4dNWHRE0mdiV2pjKziBWl8eJ9vw_W0QwSPc8dHNG987LcvZbge8sAotumgLIsPXezuat2un5iWK2fZ2edGhNKvjLswVuU_hPbfd6Rms4mZLz2-qwrc5T9TeXeJaTIKVfMZfkqVqxsdRWsO9iqIfzMx1Zt7eVrpxGyqEFuN0JeIp3n2qRkKF1Dev3U2JTT8djQWDltPO7v3h44Er4PN_PkllzJ6EWzmhy11m0LW2_kFyLX29oU3IEjsTQ3NTyoNZyvk4zvLir8JaLi8ZYnDlJWxCZZ4W868C7bICxik7CEX0NYxB7CwveZ-UJYOgctLJ01yGJ3mosX0Vy0vOAHzb8RzcU-M1_Q_PigaX68BjnYnebBi2getLzwB82_Ec2DfWa-oHn3oGneXYMc7k7z8EU0D1te-yBpHmyiuXgTbKZ5sInmna9B82APmof7zHxB85ODpvnJPhfAEdmZzi3VbkWbd_JrO7V4cX2idEzVXcvquUnoyuikjK2WwzJRaUjJusrLq8UgX7isM6Sm_99fVzPxrZnEWia-mqldzyS217RPUcHWVGFzJl7PFO4LT5VTwZzcnTa31Zm1lJf6XzB34ahObeVZ_jktvFOyVo2XAX6I16t1dup1trfW2WlGLOqZOt8n4uN6ncdb6-w2Iw7qmbrfJ-Juvc6T7QfEb4YcfnZqtwvAXpiDRsziTfgFzO0a5pNCsj5O9N2HLEWJ_vOvteGx-GHxgRrbQjejT_quLDp-mBWq91FNLDG8ULf0lhyZaZZn1mUJSmfm9PT0038BAAD__0jmsMU=
+
+# Check that we also collect stats on the hidden expression index virt column.
+statement ok
+CREATE INDEX ON data ((a * b))
+
+query T
+EXPLAIN ANALYZE (DISTSQL) CREATE STATISTICS s1 FROM data
+----
+planning time: 10µs
+execution time: 100µs
+distribution: <hidden>
+vectorized: <hidden>
+plan type: custom
+rows decoded from KV: 1,000 (7.8 KiB, 2,000 KVs, 1,000 gRPC calls)
+maximum memory usage: <hidden>
+DistSQL network usage: <hidden>
+regions: <hidden>
+isolation level: serializable
+priority: normal
+quality of service: regular
+·
+• create statistics
+·
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJzsWN1u2zgTvf-eYjA3Tb-lI5GSf8IrZ90Ea3QTB5bQxWIRFIw0dYXYkpekkWQDP9a-wD7ZQlK8tlXLtRAUbYP6QiBnRsM5nMMj0I9o_pyixMH47DQ8gyA8DYdBOBwEYDicj0cXECur4Ldh-AuMrsLh6DKA0wBG5xD8HoRnFxAOL87gVYsvzCtkmGYxXaoZGZR_IEeGAhl6yNBHhm28ZjjXWUTGZDoPeSxeGMb3KF2GSTpf2Nx8zTDKNKF8RJvYKaHEUN1MaUwqJu24yDAmq5JpsUxeYD9_vJ_f0gMyHGTTxSw1EhSDGwYRgxgZBnOV21oOB5XGwCGzH0kjw2EaZalJjKXUgolUCkczdQ_WgJoQtGeueY0Mx5TGpCX0OYO-YND3GPT9fPwTl1IOL8Megz7_f-5TVqUiPup7rO9Lef7r6DTs5TnevoMcr5GQ8nKqaZJkeVmWjC1NNpmRBPefv81TSHZnIKYoiymWwF23NN88WDKgScUSeq4LP5fmyfhqAJGaTs1G7FwlehUrCuPFu8EAjKU5RNkitXBE99ZJUvtaguusA4hu6wKKsrKFnS9sudL1kmE5f2qhsWpCKPlGz4dvULpLdnjbAzWbT0k77e2Wl-Yg-YuKtQtIgVU2b896KDasbHPmbTvYpsH_xMc2be31sLMedmvRiwr6di36NehFmumYNMVboK-XtftzOplomiibaYe7h-8UHAnXhZtFdEu24Phq3-oclV3cF7a9p5-J3N7huuBOnaMLR2JtruuEV-kE3yYiP1x_-HP0x-EtR3zPCiR2KRA_7sDbZIcGiV0a5H8JDRINNIg3af1KgzovRYM6W-jF4cQXzyK-aDneD-J_XeKLJq1fEb_7Uojf3ULvHU5871nE91qO_4P4X5f4XpPWr4jfeynE722h9w8nvv8s4vstp_09E9_bRXxx7O0mvreL-J0vQXyvAfH9Jq1fEf_kpRD_pMllc0xmnqWGKteu3Su5lZVaPL-fUTyh8jJnsoWO6EpnURFbTkdFosIQk7Gll5eTYbpyGatJzf67K29m4nszia1MfDNTu5pJ7K-pSVHe3lR-fSZezeQ3haeKrmBK9i7Tt-XxNZTmH4fiJrxylAe49Ky_XCvvjIxRk3WAW_xTta6zU62zvbfOTj1iUc3U-TYRd6t1dvfW2atH7FUz9b5NxL1qnSf7D4hbD9n_5NTuF4BGmL1azOLY_wzmdgXzSS5ZH6bZ3fskRonu06-147H6Yf6CmphcN4OP2V1RdPgwz1Xvg5oaYnihbukNWdKzJE2MTSKUVi9oufzfvwEAAP__EuzMqA==
+
+# Check that we also collect stats on other hidden columns.
+statement ok
+ALTER TABLE data ALTER COLUMN c SET NOT VISIBLE
+
+statement ok
+ALTER TABLE data ALTER COLUMN c SET NOT VISIBLE
+
+query T
+EXPLAIN ANALYZE (DISTSQL) CREATE STATISTICS s1 FROM data
+----
+planning time: 10µs
+execution time: 100µs
+distribution: <hidden>
+vectorized: <hidden>
+plan type: custom
+rows decoded from KV: 1,000 (7.8 KiB, 2,000 KVs, 1,000 gRPC calls)
+maximum memory usage: <hidden>
+DistSQL network usage: <hidden>
+regions: <hidden>
+isolation level: serializable
+priority: normal
+quality of service: regular
+·
+• create statistics
+·
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJzsWN1u2zgTvf-eYjA3Tb-lI5GSf8IrZ90Ea3QTB5bQxWIRFIw0dYXYkpekkWQDP9a-wD7ZQlK8tlXLtRAUbYP6QiBnRsM5nMMj0I9o_pyixMH47DQ8gyA8DYdBOBwEYDicj0cXECur4Ldh-AuMrsLh6DKA0wBG5xD8HoRnFxAOL87gVYsvzCtkmGYxXaoZGZR_IEeGAhl6yNBHhm28ZjjXWUTGZDoPeSxeGMb3KF2GSTpf2Nx8zTDKNKF8RJvYKaHEUN1MaUwqJu24yDAmq5JpsUxeYD9_vJ_f0gMyHGTTxSw1EhSDGwYRgxgZBnOV21oOB5XGwCGzH0kjw2EaZalJjKXUgolUCkczdQ_WgJoQtGeueY0Mx5TGpCX0OYO-YND3GPT9fPwTl1IOL8Megz7_f-5TVqUiPup7rO9Lef7r6DTs5TnevoMcr5GQ8nKqaZJkeVmWjC1NNpmRBPefv81TSHZnIKYoiymWwF23NN88WDKgScUSeq4LP5fmyfhqAJGaTs1G7FwlehUrCuPFu8EAjKU5RNkitXBE99ZJUvtaguusA4hu6wKKsrKFnS9sudL1kmE5f2qhsWpCKPlGz4dvULpLdnjbAzWbT0k77e2Wl-Yg-YuKtQtIgVU2b896KDasbHPmbTvYpsH_xMc2be31sLMedmvRiwr6di36NehFmumYNMVboK-XtftzOplomiibaYe7h-8UHAnXhZtFdEu24Phq3-oclV3cF7a9p5-J3N7huuBOnaMLR2JtruuEV-kE3yYiP1x_-HP0x-EtR3zPCiR2KRA_7sDbZIcGiV0a5H8JDRINNIg3af1KgzovRYM6W-jF4cQXzyK-aDneD-J_XeKLJq1fEb_7Uojf3ULvHU5871nE91qO_4P4X5f4XpPWr4jfeynE722h9w8nvv8s4vstp_09E9_bRXxx7O0mvreL-J0vQXyvAfH9Jq1fEf_kpRD_pMllc0xmnqWGKteu3Su5lZVaPL-fUTyh8jJnsoWO6EpnURFbTkdFosIQk7Gll5eTYbpyGatJzf67K29m4nszia1MfDNTu5pJ7K-pSVHe3lR-fSZezeQ3haeKrmBK9i7Tt-XxNZTmH4fiJrxylAe49Ky_XCvvjIxRk3WAW_xTta6zU62zvbfOTj1iUc3U-TYRd6t1dvfW2atH7FUz9b5NxL1qnSf7D4hbD9n_5NTuF4BGmL1azOLY_wzmdgXzSS5ZH6bZ3fskRonu06-147H6Yf6CmphcN4OP2V1RdPgwz1Xvg5oaYnihbukNWdKzJE2MTSKUVi9oufzfvwEAAP__EuzMqA==
+
+# Check that we can disable stats collection on virtual computed columns.
+statement ok
+SET CLUSTER SETTING sql.stats.virtual_computed_columns.enabled = false
+
+statement error cannot create statistics on virtual column
+CREATE STATISTICS s1 ON e FROM data
+
+query T
+EXPLAIN ANALYZE (DISTSQL) CREATE STATISTICS s1 FROM data
+----
+planning time: 10µs
+execution time: 100µs
+distribution: <hidden>
+vectorized: <hidden>
+plan type: custom
+rows decoded from KV: 1,000 (7.8 KiB, 2,000 KVs, 1,000 gRPC calls)
+maximum memory usage: <hidden>
+DistSQL network usage: <hidden>
+regions: <hidden>
+isolation level: serializable
+priority: normal
+quality of service: regular
+·
+• create statistics
+·
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJzsV-Fum0gQ_n9PMZo_baV1YAE7Dr-Sc1OdVaWODOrpdLKqDUwpMmY5dlGSi_xY9wL3ZCcgnG1qXNOoaiPVP5B3Zpidb-b7FnhA9VeCLk7mlxf-JXj-hT_1_OnEA8XhzXx2BaHQAn6f-r_B7Nqfzt55cOHB7A14f3j-5RX406tLeDHghXqBDFMZ0juxIoXun8iRoYUMbWToIMMhLhhmuQxIKZmXIQ_VDdPwDl2TYZxmhS7NC4aBzAndB9SxTghd9MVNQnMSIeWGiQxD0iJOqm3KAs_Ly4dsSffIcCKTYpUqFwSDGwYBgxAZepkobQODg0hD4CD1J8qR4TQNZKpipSnVoAKRwsuVuAOtQEQEw5WpXiHDt--hrFW5kPJ6mVMUyzKlJqVrk45X5IL57z_qMUTeKggpkCGFLnDTrM0395oU5CRCF8amCb_W5mh-PYFAJInais1EnDexVmW8ej-ZgNKUQSCLVMNLutNGnOpXLpjGJoBo2RVQlSULnRW63mmxZlivH9uvtIgIXb41r-lrdM01O35knlhlCeXGcHdctdmL_6Zq7wqSp4V24Zxv_lpbVra9sncdbNvgfOZj504nOKsFbtgJboOpSGUeUk7hDqbFuhP-RRTlFAktc4ObxzcCXlqmCTdFsCRd0a9pS5ej1aRDYbst-0LkoQbarQbyXXrw4xXNn6Jogw8M63tp2tqnaX4ygrfxHlVb-1TtfAtVWz1UzfuMrVH16JmoerQDzjqek9aTOGkNDPsnJ7-ek1afsTWcPH0mnDzdAWcfz0n7SZy0B4bzk5Nfz0m7z9gaTo6fCSfHO-Cc4znpPImTzsAYfi9O2vs4aZ3Y-zlp7-Pk6Ftw0u7BSafP2BpOnj0TTp71-dyYk8pkqqj1Zr5_J7O104CXr_AURlS_7ytZ5AFd5zKoYuvlrEpUGUJSuvbyejFNG5fSOYnV_19L25n4wUzWTia-nWnYzmQdrqlPUfbBVE53Jt7O5PSFJ6qpYEr6VubLWp2K0upYLp_ljaPWZ-3ZPDMa74qUEtEmwLRxsV3nqF3n8GCdo27EVjvT6MdEfNqu8_RgneNuxHY70_jHRDxu13l2WCBmN2TnM9UePgB6YbY7MVsnzhcwD1uYz8oj62Mibz_EIbpoPv4Gey7ND8sbRKTKc9P7JG-rov37rDz1PopEEcMrsaTXpClfxWmsdBygq_OC1utf_gsAAP__KqA8nA==
+
+statement ok
+RESET CLUSTER SETTING sql.stats.virtual_computed_columns.enabled
+
+subtest regression_98373
+
+statement ok
+CREATE TABLE IF NOT EXISTS t98373 AS
+        SELECT
+                g::INT2 AS _int2,
+                g::INT4 AS _int4,
+                g::INT8 AS _int8,
+                g::FLOAT8 AS _float8,
+                '2001-01-01'::DATE + g AS _date,
+                '2001-01-01'::TIMESTAMP + g * '1 day'::INTERVAL AS _timestamp
+        FROM
+                generate_series(1, 5) AS g;
+
+statement ok
+SET vectorize = off
+
+statement ok
+SET distsql = always
+
+# These query plans should be disallowed from executing in a distributed
+# fashion, even with distsql = always. Check different flavors of EXPLAIN.
+
+query T
+EXPLAIN SELECT
+        regproc(_int2::INT8)::REGPROC AS col865
+FROM
+        t98373@[0]
+----
+distribution: local
+vectorized: false
+·
+• render
+│
+└── • scan
+      missing stats
+      table: t98373@t98373_pkey
+      spans: FULL SCAN
+
+query T
+EXPLAIN(DISTSQL) SELECT
+        regproc(_int2::INT8)::REGPROC AS col865
+FROM
+        t98373@[0]
+----
+distribution: local
+vectorized: false
+·
+• render
+│
+└── • scan
+      missing stats
+      table: t98373@t98373_pkey
+      spans: FULL SCAN
+·
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJyMkF9r2zAUxd_3KcR5akFh9sq2TE8tSTYMaZLZfhgUEzTr1hOVJU-S6Urwdx-20_1jg90HiftH5_6OTghfDQQ2nw7bm2zHLtZZURYft5es2Gw3q5J5ajrv6oujtvGVENmuXF4KkW8-HPL9it0UrHZm-eY1e5_vb1l8t7x6e3V9l1TgsE7RTrYUIO6QouIYhSgE58fSaRrI1DeIhEPbro9jueKonSeIE6KOhiBQys-GcpKK_MsEHIqi1GaSPS-cr2P3QE_gWDnTtzYINjGDo-jkmC7AkZNV5MUPW9fp2ROqgcP18SdGiLIhiPQX7mwNkQz8_9FzCp2zgX6j_tem5I9Ni3SoOEg1NP9XcL2v6eBdPc3O6X4SmgqKQpy76Zxk9rkVoifZzvgVx71xj0etIJCcY_GX4zkwPpBNGI0VX9zjJFs-dSPWvTSBOG7lA60pkm-11SHqGiL6nobhxfcAAAD__wgUvrk=
+
+statement ok
+RESET vectorize
+
+statement ok
+RESET distsql
